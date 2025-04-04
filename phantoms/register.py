@@ -3,6 +3,7 @@ import glob
 import os
 import subprocess
 import sys
+import pydicom
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -47,7 +48,9 @@ def create_spect_uniform_image(sinogram, origin=None):
     new_image.initialise(tuple(dims), tuple(voxel_size), tuple(origin))
     return new_image
 
-def plot_image_info(image, save_path, title=None):
+def plot_image_info(image, 
+                    save_path="", title=None,
+                    alpha_image=None,):
     """
     Plot mid-slices of a 3D image and overlay geometry information.
 
@@ -87,6 +90,14 @@ def plot_image_info(image, save_path, title=None):
 
     # Get the direction matrix and plot it.
     direction_matrix = geom_info.get_direction_matrix()
+
+    if alpha_image is not None:
+        # plot alpha image on all three plots
+        alpha_arr = alpha_image.as_array()
+        axes[0].imshow(alpha_arr[alpha_arr.shape[0] // 2], cmap="hot", alpha=0.5)
+        axes[1].imshow(alpha_arr[:, alpha_arr.shape[1] // 2], cmap="hot", alpha=0.5)
+        axes[2].imshow(alpha_arr[:, :, alpha_arr.shape[2] // 2], cmap="hot", alpha=0.5)
+
 
     # Define a custom colormap: red for -1, white for 0, and blue for 1.
     cmap = ListedColormap(["red", "white", "blue"])
@@ -151,19 +162,19 @@ def main():
     parser.add_argument(
         "--patient",
         type=str,
-        default="nema_phantom_data",
+        default="anthropomorphic_phantom_data",
         help="Patient name for data processing.",
     )
     parser.add_argument(
         "--spect_sub_phantom",
         type=str,
-        default="",
+        default="phantom_140",
         help="Sub-phantom name for data processing.",
     )
     parser.add_argument(
         "--pet_sub_phantom",
         type=str,
-        default="",
+        default="phantom",
         help="Sub-phantom name for data processing.",
     )
     # be careful with this. Not very cleverly implemented
@@ -178,6 +189,11 @@ def main():
         type=str,
         default="/home/storage/prepared_data/tmp",
         help="Path to the temporary working directory.",
+    )
+    parser.add_argument(
+        "--do_reconstruction",
+        action="store_true",
+        help="Flag to perform reconstructions.",
     )
     parser.add_argument(
         "--save_plots",
@@ -205,7 +221,7 @@ def main():
     parser.add_argument(
         "--xy_image_size",
         type=int,
-        default=167,
+        default=155,
         help="XY dimension size for the images.",
     )
     parser.add_argument(
@@ -215,6 +231,17 @@ def main():
         help="Zoom factors in z,y,x (comma-separated).",
     )
     args, _ = parser.parse_known_args()
+
+    if args.patient == "nema_phantom_data":  
+        pet_recon = ImageData(f"/home/sam/working/BSREM_PSMR_MIC_2024/HKEM/pet/reconstruction_x.hv")
+        spect_recon = ImageData(f"/home/sam/working/BSREM_PSMR_MIC_2024/HKEM/spect/reconstruction_x.hv")
+        alpha = True
+    else:
+        print("No PET or SPECT reconstructions found")
+        alpha = False
+
+    os.makedirs(os.path.join(args.output_path, args.patient, "PET", args.pet_sub_phantom), exist_ok=True)
+    os.makedirs(os.path.join(args.output_path, args.patient, "SPECT", args.spect_sub_phantom), exist_ok=True)
     
     # Insert the source path for custom utilities and import them.
     sys.path.insert(0, args.source_path)
@@ -223,6 +250,42 @@ def main():
         ImageCombineOperator,
         get_couch_shift_from_sinogram,
     )
+
+        
+    # Load the SPECT CTAC image and threshold it.
+    search_pattern = os.path.join(
+        args.data_path, 
+        args.patient, "SPECT", 
+        args.spect_sub_phantom, 
+        "ctac", 
+        "*.dcm"
+    )
+    print(f"Searching for files with pattern: {search_pattern}")
+    matching_files = glob.glob(search_pattern)
+    if matching_files:
+        spect_ctac = ImageData(matching_files[0])
+        spect_ctac = spect_ctac.maximum(-1000)
+        spect_ctac_dcm = pydicom.dcmread(matching_files[0])
+        spect_table_height = -spect_ctac_dcm[0x0018, 0x1130].value
+        print(f"SPECT table height: {spect_table_height}")
+    else:
+        print("No matching CTAC files found for SPECT.")
+        spect_ctac = None
+        
+    if spect_ctac is not None:
+        spect_ctac.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT",
+                args.spect_sub_phantom, 
+                "ctac_FoV_corrected.hv"
+            )
+        )
+    else:
+        print("No matching CTAC files found for SPECT.")
+        sys.exit(1)
+    
 
     pet_switch=True
 
@@ -263,7 +326,21 @@ def main():
 
         # ---------------------- PET CTAC Processing and U-map Generation ----------------------
         search_pattern = os.path.join(
-            args.data_path, args.patient, "PET", "ctac", "*.dcm"
+            args.data_path, args.patient, "PET", args.pet_sub_phantom,
+            "ct_images2", "1.3.6*", "ACoeff_MSC_MCtMaterialmap_4", "*.dcm"
+        )
+        print(f"Searching for files with pattern: {search_pattern}")
+        matching_files = glob.glob(search_pattern)
+        if matching_files:
+            pet_attn_dcm = pydicom.dcmread(matching_files[0])
+            pet_table_height = -pet_attn_dcm[0x0018, 0x1130].value
+            print(f"PET table height: {pet_table_height}")
+        else:
+            print("No matching UMAP files found for PET.")
+            pet_table_height = 0
+        
+        search_pattern = os.path.join(
+            args.data_path, args.patient, "PET", args.pet_sub_phantom, "ctac", "*.dcm"
         )
         print(f"Searching for files with pattern: {search_pattern}")
         matching_files = glob.glob(search_pattern)
@@ -328,21 +405,44 @@ def main():
                 args.pet_sub_phantom,
                 "umap.hv")
         )
+
+        # SPECT CTAC has already been loaded and thresholded.
+        # Convert SPECT CTAC to u-map using Mediso-specific parameters
         
         # we need to get rid of the offsets
         pet_umap_tmp = ImageData()
-        pet_umap_offsets = pet_umap.get_geometrical_info().get_offset()
+        if args.patient == "anthropomorphic_phantom_data":
+            pet_umap_offsets = [0]
+        else:
+            pet_umap_offsets = pet_umap.get_geometrical_info().get_offset()
         offset_z = (
             (pet_umap.voxel_sizes()[0] * pet_umap.shape[0])
-            - (pet_image.voxel_sizes()[0]
-            * pet_image.shape[0])
+            - (pet_image.voxel_sizes()[0] * pet_image.shape[0])
+        ) / 2 - pet_umap_offsets[-1]
+        if args.patient == "anthropomorphic_phantom_data":
+            offset_y = 0
+        else:
+            offset_y = ((pet_umap.voxel_sizes()[1] * pet_umap.shape[1])
+            - (pet_image.voxel_sizes()[1] * pet_image.shape[1])
         ) / 2
-        pet_umap_tmp.initialise(pet_umap.shape, pet_umap.voxel_sizes(), (-offset_z, 0, 0))
+            offset_y = pet_table_height - spect_table_height
+            print(f"Offset y: {offset_y}")
+        pet_umap_tmp.initialise(pet_umap.shape, pet_umap.voxel_sizes(), (-offset_z, offset_y, 0))
         pet_umap_tmp.fill(pet_umap.as_array())
         pet_umap = pet_umap_tmp    
         
         pet_umap_zoomed2pet = pet_umap.zoom_image_as_template(
             pet_image, scaling="preserve_values"
+        )
+        
+        pet_umap_zoomed2pet.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "PET", 
+                args.pet_sub_phantom,
+                "umap_zoomed.hv"
+            )
         )
 
         if args.save_plots:
@@ -357,6 +457,20 @@ def main():
                 ),
                 "PET u-map",
             )
+            if alpha:
+                plot_image_info(
+                    pet_umap_zoomed2pet,
+                    os.path.join(
+                        args.output_path, 
+                        args.patient, 
+                        "PET", 
+                        args.pet_sub_phantom,
+                        f"umap_zoomed_info_with_pet_{offset_y:.2f}.png"
+                    ),
+                    "PET u-map zoomed to combined PET",
+                    alpha_image=pet_recon,
+                )
+
             plot_image_info(
                 pet_umap_zoomed2pet,
                 os.path.join(
@@ -364,45 +478,12 @@ def main():
                     args.patient, 
                     "PET", 
                     args.pet_sub_phantom,
-                    "umap_zoomed_info.png"
+                    f"umap_zoomed_info_{offset_y:.2f}.png"
                 ),
                 "PET u-map zoomed to combined PET",
             )
 
     # ---------------------- SPECT Data Processing ----------------------
-    
-    # Load the SPECT CTAC image and threshold it.
-    search_pattern = os.path.join(
-        args.data_path, 
-        args.patient, "SPECT", 
-        args.spect_sub_phantom, 
-        "ctac", 
-        "*.dcm"
-    )
-    print(f"Searching for files with pattern: {search_pattern}")
-    matching_files = glob.glob(search_pattern)
-    if matching_files:
-        spect_ctac = ImageData(matching_files[0])
-        spect_ctac = spect_ctac.maximum(-1000)
-    else:
-        print("No matching CTAC files found for SPECT.")
-        spect_ctac = None
-        
-    if spect_ctac is not None:
-        spect_ctac.write(
-            os.path.join(
-                args.output_path, 
-                args.patient, 
-                "SPECT",
-                args.spect_sub_phantom, 
-                "ctac_FoV_corrected.hv"
-            )
-        )
-    else:
-        print("No matching CTAC files found for SPECT.")
-        sys.exit(1)
-    
-    # Convert SPECT CTAC to u-map using Mediso-specific parameters
     
     
     try:
@@ -475,7 +556,6 @@ def main():
     
     # we need to get rid of the offsets
     spect_umap_tmp = ImageData()
-    spect_umap_offsets = spect_umap.get_geometrical_info().get_offset()
     offset_z = (
         (spect_umap.voxel_sizes()[0] * spect_umap.shape[0])
         - (spect_image.voxel_sizes()[0]
@@ -513,6 +593,20 @@ def main():
     )
 
     if args.save_plots:
+        if alpha:
+            plot_image_info(
+                spect_umap_zoomed2spect,
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "SPECT", 
+                    args.spect_sub_phantom, 
+                    "umap_zoomed2spect_info_with_spect.png"
+                ),
+                "SPECT u-map zoomed to SPECT resolution",
+                alpha_image=spect_recon,
+            )
+
         plot_image_info(
             spect_umap_zoomed2spect,
             os.path.join(
@@ -543,6 +637,34 @@ def main():
                 "SPECT", 
                 args.spect_sub_phantom, 
                 "spect2pet.tfm")
+        )
+        rev_transformation = reg.get_transformation_matrix_inverse()
+        rev_transformation.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                args.spect_sub_phantom, 
+                "pet2spect.tfm"
+            )
+        )
+        displacement = reg.get_displacement_field_forward()
+        displacement.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                args.spect_sub_phantom, 
+                "spect2pet")
+        )
+        rev_displacement = reg.get_displacement_field_inverse()
+        rev_displacement.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                args.spect_sub_phantom, 
+                "pet2spect")
         )
         spect_umap_zoomed_registered = reg.get_output()
         spect_umap_zoomed_registered.write(
@@ -632,6 +754,85 @@ def main():
                 "umap_zoomed_diff.png"
             )
         )
+
+    # ---------------------- Run Reconstructions if Requested ----------------------
+    if args.do_reconstruction:
+        directory = os.path.dirname(os.path.abspath(__file__))
+        pet_osem_script = os.path.join(directory, "pet_osem.py")
+        spect_osem_script = os.path.join(directory, "spect_osem.py")
+        
+        # Run PET reconstruction (single bed position; use suffix "none")
+        try:
+            subprocess.run(
+                [sys.executable, pet_osem_script,
+                "--data_path", args.data_path,
+                "--output_path", args.output_path,
+                "--suffix", "none"],
+                check=True
+            )
+            print("PET reconstruction completed successfully.")
+            pet_recon = ImageData(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "PET", 
+                    args.pet_sub_phantom,
+                    "pet_recon.hv"
+                )
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"PET reconstruction failed: {e}")
+        
+        # Run SPECT reconstruction
+        try:
+            subprocess.run(
+                [sys.executable, spect_osem_script,
+                "--data_path", args.data_path],
+                check=True
+            )
+            print("SPECT reconstruction completed successfully.")
+            spect_recon = ImageData(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "SPECT", 
+                    args.spect_sub_phantom,
+                    "spect_recon.hv"
+                )
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"SPECT reconstruction failed: {e}")
+        
+        # Generate overlay plots (if save_plots is enabled)
+        if args.save_plots:
+            # Overlay PET reconstruction on the zoomed PET u-map.
+            pet_overlay_path = os.path.join(
+                args.output_path, 
+                args.patient, 
+                "PET", 
+                args.pet_sub_phantom,
+                "pet_mu_overlay.png"
+            )
+            plot_image_info(
+                pet_umap_zoomed2pet,
+                save_path=pet_overlay_path,
+                title="PET u-map with PET reconstruction overlay",
+                alpha_image=pet_recon
+            )
+            # Overlay SPECT reconstruction on the zoomed SPECT u-map.
+            spect_overlay_path = os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                args.spect_sub_phantom,
+                "spect_mu_overlay.png"
+            )
+            plot_image_info(
+                spect_umap_zoomed2spect,
+                save_path=spect_overlay_path,
+                title="SPECT u-map with SPECT reconstruction overlay",
+                alpha_image=spect_recon
+            )
 
 
 if __name__ == "__main__":

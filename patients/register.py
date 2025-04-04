@@ -50,21 +50,76 @@ def create_spect_uniform_image(sinogram, origin=None):
     new_image.initialise(tuple(dims), tuple(voxel_size), tuple(origin))
     return new_image
 
+def plot_overlay(mu_map, overlay_img, save_path, title=None, ct=False):
+    """
+    Plot central slices of a mu-map with an overlay image (e.g. CTAC) superimposed.
+    
+    For each of the three spatial dimensions the central slice is extracted from both 
+    the mu-map and the overlay image. The overlay image is displayed using a jet colormap
+    with transparency, over the mu-map in grayscale.
+    
+    Args:
+        mu_map (ImageData): The attenuation (u-map) image.
+        overlay_img (ImageData): The CTAC image to overlay.
+        save_path (str): Path (including filename) to save the plot.
+        title (str, optional): Title for the figure.
+        ct (bool, optional): If True, use typical CT intensity limits (e.g. -1000 to 1000).
+    """
+    mu_arr = mu_map.as_array()
+    overlay_arr = overlay_img.as_array()
+    
+    # Determine intensity limits.
+    if ct:
+        mu_vmin, mu_vmax = np.percentile(mu_arr, 5), np.percentile(mu_arr, 95)
+        overlay_vmin, overlay_vmax = -1000, 1000
+    else:
+        mu_vmin, mu_vmax = mu_arr.min(), mu_arr.max()
+        overlay_vmin, overlay_vmax = overlay_arr.min(), overlay_arr.max()
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    # Use the central slice for each dimension.
+    slices = [mu_arr.shape[0] // 2, mu_arr.shape[1] // 2, mu_arr.shape[2] // 2]
+    
+    for i, s in enumerate(slices):
+        if i == 0:
+            mu_slice = mu_arr[s, :, :]
+            overlay_slice = overlay_arr[s, :, :]
+        elif i == 1:
+            mu_slice = mu_arr[:, s, :]
+            overlay_slice = overlay_arr[:, s, :]
+        else:
+            mu_slice = mu_arr[:, :, s]
+            overlay_slice = overlay_arr[:, :, s]
+        
+        axes[i].imshow(mu_slice, cmap='gray', vmin=mu_vmin, vmax=mu_vmax)
+        axes[i].imshow(overlay_slice, cmap='jet', alpha=0.5, vmin=overlay_vmin, vmax=overlay_vmax)
+        axes[i].axis('off')
+    
+    if title:
+        fig.suptitle(title)
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
 
-def plot_image_info(image, save_path, title=None):
+
+def plot_image_info(image, save_path, title=None, add_colorbar=True, ct=False):
     """
     Plot mid-slices of a 3D image and overlay geometry information.
 
     The function plots:
       - The central slice in each spatial dimension (x, y, z).
-      - The direction matrix using a custom color map (-1 as red, 0 as white, and 1 as blue)
+      - The direction matrix using a custom colormap (-1 as red, 0 as white, and 1 as blue)
         with the numerical values overlaid.
+      - Optionally, a vertical colorbar for the first (gray-scale) image.
 
     Args:
         image: An image object with methods `get_geometrical_info()` and `as_array()`,
             and an attribute `shape` (e.g., a PET/SPECT ImageData).
         save_path (str): File path (including filename) where the plot will be saved.
         title (str, optional): A main title for the figure.
+        add_colorbar (bool, optional): Whether to add a vertical colorbar to the first image.
+            Defaults to True.
     """
     # Retrieve geometry information from the image.
     geom_info = image.get_geometrical_info()
@@ -79,10 +134,19 @@ def plot_image_info(image, save_path, title=None):
     fig, axes = plt.subplots(1, 4, figsize=(15, 5))
     arr = image.as_array()
 
+    if ct:
+        vmax = 1000
+        vmin = -1000
+    else:
+        vmax = arr.max()
+        vmin = 0
+
     # Plot central slices along each dimension.
-    axes[0].imshow(arr[arr.shape[0] // 2], cmap="gray")
-    axes[1].imshow(arr[:, arr.shape[1] // 2], cmap="gray")
-    axes[2].imshow(arr[:, :, arr.shape[2] // 2], cmap="gray")
+    im0 = axes[0].imshow(arr[arr.shape[0] // 2], cmap="gray", vmin=vmin, vmax=vmax)
+    if add_colorbar:
+        fig.colorbar(im0, ax=axes[0], orientation="vertical")
+    axes[1].imshow(arr[:, arr.shape[1] // 2], cmap="gray", vmin=vmin, vmax=vmax)
+    axes[2].imshow(arr[:, :, arr.shape[2] // 2], cmap="gray", vmin=vmin, vmax=vmax)
 
     # Get the direction matrix and plot it.
     direction_matrix = geom_info.get_direction_matrix()
@@ -140,6 +204,9 @@ def crop_ct_to_body(ct_image):
     out = ct_image.clone()
     out.fill(ct_arr)
 
+    # remove temporary file
+    os.remove("ct_image_tmp.nii")
+
     return out
 
 def main():
@@ -179,7 +246,7 @@ def main():
     parser.add_argument(
         "--patient",
         type=str,
-        default="sirt4",
+        default="sirt3",
         help="Patient name for data processing.",
     )
     # be careful with this. Not very cleverly implemented
@@ -226,8 +293,8 @@ def main():
     parser.add_argument(
         "--xy_image_size",
         type=int,
-        default=288,
-        help="XY dimension size for the images.",
+        default=185,
+        help="XY dimension size for the PET images.",
     )
     parser.add_argument(
         "--zooms",
@@ -235,7 +302,17 @@ def main():
         default=[1, 2, 2],
         help="Zoom factors in z,y,x (comma-separated).",
     )
-    args, _ = parser.parse_known_args()
+    parser.add_argument(
+        "--do_reconstruction",
+        action="store_true",
+        help="Flag to perform reconstruction.",
+    )
+    parser.add_argument(
+        "--do_registration",
+        action="store_true",
+        help="Flag to perform registration.",
+    )
+    args = parser.parse_args()
 
     # Insert the source path for custom utilities and import them.
     sys.path.insert(0, args.source_path)
@@ -322,234 +399,148 @@ def main():
         )
     )
 
-    # ---------------------- PET CTAC Processing and U-map Generation ----------------------
-    search_pattern = os.path.join(
-        args.data_path, args.patient, "PET", "ctac", "i42*CTDC*.img"
-    )
-    print(f"Searching for files with pattern: {search_pattern}")
-    matching_files = glob.glob(search_pattern)
-    if matching_files:
-        pet_ctac = ImageData(matching_files[0])
-        pet_ctac = pet_ctac.maximum(-1000)
-        pet_ctac_crop = crop_ct_to_body(pet_ctac)
-    else:
-        print("No matching CTAC files found for PET.")
-        pet_ctac = None
+    if args.do_registration:
 
-    # Convert CTAC to attenuation (u-map) if the CTAC image was found.
-    if pet_ctac is not None:
-        pet_ctac.write(
-            os.path.join(
-                args.output_path, args.patient, "PET", "ctac_FoV_corrected.hv"
-            )
+        # ---------------------- PET CTAC Processing and U-map Generation ----------------------
+        search_pattern = os.path.join(
+            args.data_path, args.patient, "PET", "ctac", "i42*CTDC*.img"
         )
-        pet_ctac_crop.write(
-            os.path.join(
-                args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop.hv"
+        print(f"Searching for files with pattern: {search_pattern}")
+        matching_files = glob.glob(search_pattern)
+        if matching_files:
+            pet_ctac = ImageData(matching_files[0])
+            pet_ctac = pet_ctac.maximum(-1000)
+            pet_ctac_crop = crop_ct_to_body(pet_ctac)
+        else:
+            print("No matching CTAC files found for PET.")
+            pet_ctac = None
+
+        # Convert CTAC to attenuation (u-map) if the CTAC image was found.
+        if pet_ctac is not None:
+            pet_ctac.write(
+                os.path.join(
+                    args.output_path, args.patient, "PET", "ctac_FoV_corrected.hv"
+                )
             )
-        )
-        try:
-            subprocess.run(
-                [
-                    "ctac_to_mu_values",
-                    "-o",
-                    os.path.join(args.output_path, args.patient, "PET", "umap.hv"),
-                    "-i",
+            pet_ctac_crop.write(
+                os.path.join(
+                    args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop.hv"
+                )
+            )
+            if args.save_plots:
+                plot_image_info(
+                    pet_ctac_crop,
                     os.path.join(
-                        args.output_path,
-                        args.patient,
-                        "PET",
-                        "ctac_FoV_corrected.hv",
+                        args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop_info.png"
                     ),
-                    "-j",
-                    "/home/sam/devel/SIRF_builds/master/build/sources/STIR/src/config/ct_slopes.json",
-                    "-m",
-                    "GE",
-                    "-v",
-                    "80",
-                    "-k",
-                    "511",
-                ],
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Error converting PET CTAC to u-map: {e}")
+                    "PET CTAC cropped to body",
+                    ct=True
+                )
+                plot_image_info(
+                    pet_ctac,
+                    os.path.join(
+                        args.output_path, args.patient, "PET", "ctac_FoV_corrected_info.png"
+                    ),
+                    "PET CTAC",
+                    ct=True
+                )
+            try:
+                subprocess.run(
+                    [
+                        "ctac_to_mu_values",
+                        "-o",
+                        os.path.join(args.output_path, args.patient, "PET", "umap.hv"),
+                        "-i",
+                        os.path.join(
+                            args.output_path,
+                            args.patient,
+                            "PET",
+                            "ctac_FoV_corrected.hv",
+                        ),
+                        "-j",
+                        "/home/sam/devel/SIRF_builds/master/build/sources/STIR/src/config/ct_slopes.json",
+                        "-m",
+                        "GE",
+                        "-v",
+                        "80",
+                        "-k",
+                        "511",
+                    ],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"Error converting PET CTAC to u-map: {e}")
 
-    # Load the generated PET u-map and zoom to match the combined image template.
-    pet_umap = ImageData(
-        os.path.join(args.output_path, args.patient, "PET", "umap.hv")
-    )
-    pet_umap_zoomed2pet = pet_umap.zoom_image_as_template(
-        pet_combined_image, scaling="preserve_values"
-    )
-
-    pet_ctac_crop_zoomed2pet = pet_ctac_crop.zoom_image_as_template(
-        pet_combined_image, scaling="preserve_values"
-    )
-    pet_ctac_crop_zoomed2pet.write(
-        os.path.join(
-            args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop_zoomed.hv"
+        # Load the generated PET u-map and zoom to match the combined image template.
+        pet_umap = ImageData(
+            os.path.join(args.output_path, args.patient, "PET", "umap.hv")
         )
-    )
-    if args.save_plots:
-        plot_image_info(
-            pet_ctac_crop_zoomed2pet,
+        pet_umap_zoomed2pet = pet_umap.zoom_image_as_template(
+            pet_combined_image, scaling="preserve_values"
+        )
+
+        pet_ctac_crop_zoomed2pet = pet_ctac_crop.zoom_image_as_template(
+            pet_combined_image, scaling="preserve_values"
+        )
+        pet_ctac_crop_zoomed2pet.write(
             os.path.join(
-                args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop_zoomed_info.png"
-            ),
-            "PET CTAC cropped to body and zoomed to PET resolution",
-        )
-
-    # Create u-maps for each shifted image by zooming and then unshifting.
-    pet_umaps_bed_pos = [
-        pet_umap_zoomed2pet.zoom_image_as_template(
-            image, scaling="preserve_values"
-        )
-        for image in pet_shifted_images
-    ]
-    for pet_umap_item, pos, op in zip(pet_umaps_bed_pos, bed_pos, pet_shift_ops):
-        pet_umap_item = op.adjoint(pet_umap_item)
-        # Verify that geometrical information remains consistent.
-        assert (
-            pet_umap_item.get_geometrical_info().get_info()
-            == pet_umap_item.get_geometrical_info().get_info()
-        )
-        pet_umap_item.write(
-            os.path.join(
-                args.output_path, args.patient, "PET", f"umap_{pos}.hv"
+                args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop_zoomed.hv"
             )
         )
+        if args.save_plots:
+            plot_image_info(
+                pet_ctac_crop_zoomed2pet,
+                os.path.join(
+                    args.output_path, args.patient, "PET", "ctac_FoV_corrected_crop_zoomed_info.png"
+                ),
+                "PET CTAC cropped to body and zoomed to PET resolution",
+                ct=True
+            )
+
+        # Create u-maps for each shifted image by zooming and then unshifting.
+        pet_umaps_bed_pos = [
+            pet_umap_zoomed2pet.zoom_image_as_template(
+                image, scaling="preserve_values"
+            )
+            for image in pet_shifted_images
+        ]
+        for pet_umap_item, pos, op in zip(pet_umaps_bed_pos, bed_pos, pet_shift_ops):
+            pet_umap_item = op.adjoint(pet_umap_item)
+            # Verify that geometrical information remains consistent.
+            assert (
+                pet_umap_item.get_geometrical_info().get_info()
+                == pet_umap_item.get_geometrical_info().get_info()
+            )
+            pet_umap_item.write(
+                os.path.join(
+                    args.output_path, args.patient, "PET", f"umap_{pos}.hv"
+                )
+            )
+
+            if args.save_plots:
+                plot_image_info(
+                    pet_umap_item,
+                    os.path.join(
+                        args.output_path, args.patient, "PET", f"umap_{pos}_info.png"
+                    ),
+                    f"PET u-map zoomed to {pos}",
+                )
 
         if args.save_plots:
             plot_image_info(
-                pet_umap_item,
-                os.path.join(
-                    args.output_path, args.patient, "PET", f"umap_{pos}_info.png"
-                ),
-                f"PET u-map zoomed to {pos}",
+                pet_umap,
+                os.path.join(args.output_path, args.patient, "PET", "umap_info.png"),
+                "PET u-map",
             )
-
-    if args.save_plots:
-        plot_image_info(
-            pet_umap,
-            os.path.join(args.output_path, args.patient, "PET", "umap_info.png"),
-            "PET u-map",
-        )
-        plot_image_info(
-            pet_umap_zoomed2pet,
-            os.path.join(args.output_path, args.patient, "PET", "umap_zoomed_info.png"),
-            "PET u-map zoomed to combined PET",
-        )
+            plot_image_info(
+                pet_umap_zoomed2pet,
+                os.path.join(args.output_path, args.patient, "PET", "umap_zoomed_info.png"),
+                "PET u-map zoomed to combined PET",
+            )
 
     # ---------------------- SPECT Data Processing ----------------------
-    # Load SPECT CTAC image from DICOM.
-    search_pattern = os.path.join(
-        args.data_path, 
-        args.patient, 
-        "SPECT", 
-        "CTSIRT-ABDO-PELVISTOMOCT",
-        "1.2.*.dcm",
-    )
-    print(f"Searching for files with pattern: {search_pattern}")
-    matching_files = glob.glob(search_pattern)
-    if matching_files:
-        spect_ctac = ImageData(matching_files[0])
-        spect_ctac = spect_ctac.maximum(-1000)
-        spect_ctac_crop = crop_ct_to_body(spect_ctac)
-    else:
-        print("No matching CTAC files found for PET.")
-        spect_ctac = None
 
-    if spect_ctac is not None:
-        spect_ctac.write(
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "ctac_FoV_corrected.hv"
-            )
-        )
-        spect_ctac_crop.write(
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop.hv"
-            )
-        )
-        if args.save_plots:
-            plot_image_info(
-                spect_ctac_crop,
-                os.path.join(
-                    args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_info.png"
-                ),
-                "SPECT CTAC cropped to body",
-            )
-    else:
-        print("No matching CTAC files found for SPECT.")
-
-    # Convert SPECT CTAC to u-map using Mediso-specific parameters.
-    try:
-        subprocess.run(
-            [
-                "ctac_to_mu_values",
-                "-o",
-                os.path.join(args.output_path, 
-                             args.patient, 
-                             "SPECT", 
-                             "umap.hv"
-                ),
-                "-i",
-                os.path.join(
-                    args.output_path,
-                    args.patient,
-                    "SPECT",
-                    "ctac_FoV_corrected.hv",
-                ),
-                "-j",
-                "/home/sam/devel/SIRF_builds/master/build/sources/STIR/src/config/ct_slopes.json",
-                "-m",
-                "Mediso",
-                "-v",
-                "120",
-                "-k",
-                "80",
-            ],
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"Error converting SPECT CTAC to u-map: {e}")
-
-    # Load the SPECT u-map.
-    spect_umap = ImageData(
-        os.path.join(args.output_path, args.patient, "SPECT", "umap.hv")
-    )
-    if args.save_plots:
-        plot_image_info(
-            spect_umap,
-            os.path.join(args.output_path, args.patient, "SPECT", "umap_info.png"),
-            "SPECT u-map",
-        )
-
-    # Compute zoom factors to match SPECT u-map to PET resolution.
-    zooms = tuple(
-        b / a for a, b in zip(pet_umap.voxel_sizes(), spect_umap.voxel_sizes())
-    )
-    spect_umap_zoomed2pet = spect_umap.zoom_image(
-        zooms=zooms, scaling="preserve_values"
-    )
-    np.savetxt(
-        os.path.join(args.output_path, args.patient, "SPECT", "zooms_spect_ct2pet.csv"),
-        zooms,
-        delimiter=",",
-    )
-    spect_umap_zoomed2pet.write(
-        os.path.join(args.output_path, args.patient, "SPECT", "umap_zoomed2pet.hv")
-    )
-    if args.save_plots:
-        plot_image_info(
-            spect_umap_zoomed2pet,
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "umap_zoomed2pet_info.png"
-            ),
-            "SPECT u-map zoomed to PET resolution",
-        )
-
-    # Create a uniform SPECT image template from the sinogram.
+        # Create a uniform SPECT image template from the sinogram.
     spect_sino = AcquisitionData(
         os.path.join(args.data_path, args.patient, "SPECT", "peak.hs")
     )
@@ -558,210 +549,467 @@ def main():
         os.path.join(args.output_path, args.patient, "SPECT", "template_image.hv")
     )
 
-    # Compute offset adjustments between the SPECT and PET u-maps.
-    # This bit is a little bit horrible but necessary to get the correct offset
-    spect_umap_offsets = spect_umap.get_geometrical_info().get_offset()
-    offset_z = (
-        (spect_umap.voxel_sizes()[0] * spect_umap.shape[0])
-        - (spect_image_from_sinogram.voxel_sizes()[0]
-           * spect_image_from_sinogram.shape[0])
-    ) / 2
-    spect_template_image = create_spect_uniform_image(
-        spect_sino, origin=(-offset_z, 0, -spect_umap_offsets[0] * 2)
-    )
-
-    # Compute zoom factors to match the SPECT u-map to the SPECT template.
-    zooms = tuple(
-        b / a
-        for a, b in zip(
-            spect_template_image.voxel_sizes(), spect_umap.voxel_sizes()
+    if args.do_registration:
+        # Load SPECT CTAC image from DICOM.
+        search_pattern = os.path.join(
+            args.data_path, 
+            args.patient, 
+            "SPECT", 
+            "CTSIRT-ABDO-PELVISTOMOCT",
+            "1.2.*.dcm",
         )
-    )
-    spect_umap_zoomed2spect = spect_umap.zoom_image(
-        zooms=zooms, scaling="preserve_values"
-    )
-    np.savetxt(
-        os.path.join(
-            args.output_path, args.patient, "SPECT", "zooms_spect_ct2spect.csv"
-        ),
-        zooms,
-        delimiter=",",
-    )
-    spect_ctac_crop_zoomed2spect = spect_ctac_crop.zoom_image(
-        zooms=zooms, scaling="preserve_values"
-    )
+        print(f"Searching for files with pattern: {search_pattern}")
+        matching_files = glob.glob(search_pattern)
+        if matching_files:
+            spect_ctac = ImageData(matching_files[0])
+            spect_ctac = spect_ctac.maximum(-1000)
+            spect_ctac_crop = crop_ct_to_body(spect_ctac)
+        else:
+            print("No matching CTAC files found for PET.")
+            spect_ctac = None
 
-    def zoom_and_shift_image(image, template_image, reference_image, output_filepath, flip_axes=(0, 2)):
-        """
-        Process an image by applying a zero couch shift, zooming it to match a provided template,
-        """
-        # Apply a couch shift with zero shift.
-        shift_op = CouchShiftOperator(image, 0)
-        shifted_image = shift_op.direct(image)
-        
-        # Zoom the shifted image to match the template image (preserving values).
-        zoomed_image = shifted_image.zoom_image_as_template(template_image, scaling="preserve_values")
-        
-        # Flip the image along the specified axes.
-        flipped_array = np.flip(zoomed_image.as_array(), axis=flip_axes)
-        zoomed_image.fill(flipped_array)
-        
-        # Adjust the offset manually by filling the reference image with the updated array.
-        reference_image.fill(zoomed_image.as_array())
-        
-        # Clone the reference image to obtain the final processed image.
-        final_image = reference_image.clone()
-        
-        # Save the final processed image.
-        final_image.write(output_filepath)
-        
-        return final_image
-    
-    spect_umap_zoomed2spect = zoom_and_shift_image(
-        spect_umap_zoomed2spect,
-        spect_template_image, 
-        spect_image_from_sinogram,
-        os.path.join(args.output_path, args.patient, "SPECT", "umap_zoomed2spect.hv"),
-        flip_axes=(0, 2)
-    )
+        if spect_ctac is not None:
+            spect_ctac.write(
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "ctac_FoV_corrected.hv"
+                )
+            )
+            spect_ctac_crop.write(
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop.hv"
+                )
+            )
+            if args.save_plots:
+                plot_image_info(
+                    spect_ctac_crop,
+                    os.path.join(
+                        args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_info.png"
+                    ),
+                    "SPECT CTAC cropped to body",
+                    ct=True
+                )
+                plot_image_info(
+                    spect_ctac,
+                    os.path.join(
+                        args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_info.png"
+                    ),
+                    "SPECT CTAC",
+                    ct=True
+                )
+        else:
+            print("No matching CTAC files found for SPECT.")
 
-    spect_ctac_crop_zoomed2spect = zoom_and_shift_image(
-        spect_ctac_crop_zoomed2spect,
-        spect_template_image, 
-        spect_image_from_sinogram,
-        os.path.join(args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed2spect.hv"),
-        flip_axes=(0, 2)
-    )
+        # Convert SPECT CTAC to u-map using Mediso-specific parameters.
+        try:
+            subprocess.run(
+                [
+                    "ctac_to_mu_values",
+                    "-o",
+                    os.path.join(args.output_path, 
+                                args.patient, 
+                                "SPECT", 
+                                "umap.hv"
+                    ),
+                    "-i",
+                    os.path.join(
+                        args.output_path,
+                        args.patient,
+                        "SPECT",
+                        "ctac_FoV_corrected.hv",
+                    ),
+                    "-j",
+                    "/home/sam/devel/SIRF_builds/master/build/sources/STIR/src/config/ct_slopes.json",
+                    "-m",
+                    "Mediso",
+                    "-v",
+                    "120",
+                    "-k",
+                    "80",
+                ],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Error converting SPECT CTAC to u-map: {e}")
 
-    if args.save_plots:
-        plot_image_info(
-            spect_umap_zoomed2spect,
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "umap_zoomed2spect_info.png"
-            ),
-            "SPECT u-map zoomed to SPECT resolution",
+        # Load the SPECT u-map.
+        spect_umap = ImageData(
+            os.path.join(args.output_path, args.patient, "SPECT", "umap.hv")
         )
-        plot_image_info(
-            spect_ctac_crop_zoomed2spect,
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed2spect_info.png"
-            ),
-            "SPECT CTAC cropped to body and zoomed to SPECT resolution",
+        if args.save_plots:
+            plot_image_info(
+                spect_umap,
+                os.path.join(args.output_path, args.patient, "SPECT", "umap_info.png"),
+                "SPECT u-map",
+            )
+
+        # Compute zoom factors to match SPECT u-map to PET resolution.
+        zooms = tuple(
+            b / a for a, b in zip(pet_umap.voxel_sizes(), spect_umap.voxel_sizes())
+        )
+        spect_umap_zoomed2pet = spect_umap.zoom_image(
+            zooms=zooms, scaling="preserve_values"
+        )
+        np.savetxt(
+            os.path.join(args.output_path, args.patient, "SPECT", "zooms_spect_ct2pet.csv"),
+            zooms,
+            delimiter=",",
+        )
+        spect_umap_zoomed2pet.write(
+            os.path.join(args.output_path, args.patient, "SPECT", "umap_zoomed2pet.hv")
+        )
+        if args.save_plots:
+            plot_image_info(
+                spect_umap_zoomed2pet,
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "umap_zoomed2pet_info.png"
+                ),
+                "SPECT u-map zoomed to PET resolution",
+            )
+
+        # Compute offset adjustments between the SPECT and PET u-maps.
+        # This bit is a little bit horrible but necessary to get the correct offset
+        spect_umap_offsets = spect_umap.get_geometrical_info().get_offset()
+        offset_z = (
+            (spect_umap.voxel_sizes()[0] * spect_umap.shape[0])
+            - (spect_image_from_sinogram.voxel_sizes()[0]
+            * spect_image_from_sinogram.shape[0])
+        ) / 2
+        spect_template_image = create_spect_uniform_image(
+            spect_sino, origin=(-offset_z, 0, -spect_umap_offsets[0] * 2)
         )
 
-    # ---------------------- Registration of SPECT to PET ----------------------
-    reg_rigid = NiftyAladinSym()
-    reg_rigid.set_reference_image(pet_ctac_crop_zoomed2pet)
-    reg_rigid.set_floating_image(spect_ctac_crop_zoomed2spect)
-    reg_rigid.set_parameter("SetPerformRigid", "1")
-    reg_rigid.set_parameter("SetPerformAffine", "0")
-    reg_rigid.process()
-    transform = reg_rigid.get_transformation_matrix_forward()
-
-    if args.save_plots:
-        spect_ctac_zoomed_registered_rigid = reg_rigid.get_output()
-        plot_image_info(
-            spect_ctac_zoomed_registered_rigid,
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed_registered_rigid_info.png"
-            ),
-            "SPECT u-map registered to PET (rigid)",
-        )
-
-    reg = NiftyF3dSym()
-    reg.set_reference_image(pet_ctac_crop_zoomed2pet)
-    reg.set_floating_image(spect_ctac_crop_zoomed2spect)
-    reg.set_initial_affine_transformation(transform)
-    reg.print_all_wrapped_methods()
-    reg.process()
-
-    # Save the displacement field.
-    displacement = reg.get_displacement_field_forward()
-    displacement.write(
-        os.path.join(args.output_path, args.patient, "SPECT", "spect2pet")
-    )
-
-    if args.save_plots:
-        plt.figure()
-        for i in range(3):
-            plt.subplot(3, 1, 1 + i)
-            im_slice = displacement.as_array()[displacement.shape[0]//2,:,:,0,i]
-            minmax = max(abs(im_slice.min()), abs(im_slice.max()))
-            plt.imshow(im_slice, cmap="seismic", vmin=-minmax, vmax=minmax)
-            plt.title(f"Displacement field in direction {i}")
-        plt.savefig(
-            os.path.join(
-                args.output_path, args.patient, "SPECT", "displacement_field.png"
+        # Compute zoom factors to match the SPECT u-map to the SPECT template.
+        zooms = tuple(
+            b / a
+            for a, b in zip(
+                spect_template_image.voxel_sizes(), spect_umap.voxel_sizes()
             )
         )
-    spect_ctac_zoomed_registered = reg.get_output()
-    spect_ctac_zoomed_registered.write(
-        os.path.join(args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed_registered.hv")
-    )
-
-    if args.save_plots:
-        plot_image_info(
-            spect_ctac_zoomed_registered,
+        spect_umap_zoomed2spect = spect_umap.zoom_image(
+            zooms=zooms, scaling="preserve_values"
+        )
+        np.savetxt(
             os.path.join(
-                args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed_registered_info.png"
+                args.output_path, args.patient, "SPECT", "zooms_spect_ct2spect.csv"
             ),
-            "SPECT u-map registered to PET",
+            zooms,
+            delimiter=",",
+        )
+        spect_ctac_crop_zoomed2spect = spect_ctac_crop.zoom_image(
+            zooms=zooms, scaling="preserve_values"
         )
 
-    # ---------------------- Plot Difference Between PET and Registered SPECT ----------------------
-    pet_array = pet_ctac_crop_zoomed2pet.as_array()
-
-    spect_array = spect_ctac_zoomed_registered.as_array()
-
-    diff = pet_array - spect_array
-    diff_minmax = max(abs(diff.min()), abs(diff.max())) / 2
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    im0 = axes[0].imshow(
-        diff[diff.shape[0] // 2],
-        vmin=-diff_minmax,
-        vmax=diff_minmax,
-        cmap="seismic",
-    )
-    axes[1].imshow(
-        diff[:, diff.shape[1] // 2],
-        vmin=-diff_minmax,
-        vmax=diff_minmax,
-        cmap="seismic",
-    )
-    axes[2].imshow(
-        diff[:, :, diff.shape[2] // 2],
-        vmin=-diff_minmax,
-        vmax=diff_minmax,
-        cmap="seismic",
-    )
-    # cbar on left of first plot
-    cbar = fig.colorbar(
-        im0, 
-        ax=axes[0], 
-        orientation="vertical", 
-        location="left", 
-        shrink=0.7
-    )
-    cbar.set_label("PET - SPECT")
-
-    # sup title
-    fig.suptitle("Normed PET - Normed Registered SPECT")
-
-    # axis off
-    for ax in axes:
-        ax.axis("off")
-
-    plt.savefig(
-        os.path.join(
-            args.output_path, args.patient, "SPECT", "ctac_zoomed_reg_diff.png"
+        def zoom_and_shift_image(image, template_image, reference_image, output_filepath, flip_axes=(0, 2)):
+            """
+            Process an image by applying a zero couch shift, zooming it to match a provided template,
+            """
+            # Apply a couch shift with zero shift.
+            shift_op = CouchShiftOperator(image, 0)
+            shifted_image = shift_op.direct(image)
+            
+            # Zoom the shifted image to match the template image (preserving values).
+            zoomed_image = shifted_image.zoom_image_as_template(
+                template_image, scaling="preserve_values"
+            )
+            
+            # Flip the image along the specified axes.
+            flipped_array = np.flip(zoomed_image.as_array(), axis=flip_axes)
+            zoomed_image.fill(flipped_array)
+            
+            # Adjust the offset manually by filling the reference image with the updated array.
+            reference_image.fill(zoomed_image.as_array())
+            
+            # Clone the reference image to obtain the final processed image.
+            final_image = reference_image.clone()
+            
+            # Save the final processed image.
+            final_image.write(output_filepath)
+            
+            return final_image
+        
+        spect_umap_zoomed2spect = zoom_and_shift_image(
+            spect_umap_zoomed2spect,
+            spect_template_image, 
+            spect_image_from_sinogram,
+            os.path.join(args.output_path, args.patient, "SPECT", "umap_zoomed.hv"),
+            flip_axes=(0, 2)
         )
-    )
-    plt.savefig(
-        os.path.join(
-            args.output_path, args.patient, "PET", "ctac_zoomed_reg_diff.png"
+
+        spect_ctac_crop_zoomed2spect = zoom_and_shift_image(
+            spect_ctac_crop_zoomed2spect,
+            spect_template_image, 
+            spect_image_from_sinogram,
+            os.path.join(args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed2spect.hv"),
+            flip_axes=(0, 2)
         )
-    )
+
+        if args.save_plots:
+            plot_image_info(
+                spect_umap_zoomed2spect,
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "umap_zoomed2spect_info.png"
+                ),
+                "SPECT u-map zoomed to SPECT resolution",
+            )
+            plot_image_info(
+                spect_ctac_crop_zoomed2spect,
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed2spect_info.png"
+                ),
+                "SPECT CTAC cropped to body and zoomed to SPECT resolution",
+                ct=True
+            )
+
+        # ---------------------- Registration of SPECT to PET ----------------------
+        reg_rigid = NiftyAladinSym()
+        reg_rigid.set_reference_image(pet_ctac_crop_zoomed2pet)
+        reg_rigid.set_floating_image(spect_ctac_crop_zoomed2spect)
+        reg_rigid.set_parameter("SetPerformRigid", "1")
+        reg_rigid.set_parameter("SetPerformAffine", "0")
+        reg_rigid.process()
+        transform = reg_rigid.get_transformation_matrix_forward()
+        transform.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                "spect2pet_rigid.tfm")
+        )
+        displacement = reg_rigid.get_displacement_field_forward()
+        displacement.write(
+            os.path.join(
+                args.output_path, 
+                args.patient, 
+                "SPECT", 
+                "spect2pet_rigid"
+            )
+        )
+
+        if args.save_plots:
+            spect_ctac_zoomed_registered_rigid = reg_rigid.get_output()
+            plot_image_info(
+                spect_ctac_zoomed_registered_rigid,
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "SPECT", 
+                    "ctac_FoV_corrected_crop_zoomed_registered_rigid_info.png"
+                ),
+                "SPECT u-map registered to PET (rigid)",
+                ct=True
+            )
+
+        reg = NiftyF3dSym()
+        reg.set_reference_image(pet_ctac_crop_zoomed2pet)
+        reg.set_floating_image(spect_ctac_crop_zoomed2spect)
+        reg.set_initial_affine_transformation(transform)
+        reg.print_all_wrapped_methods()
+        reg.process()
+
+        # Save the displacement field.
+        displacement = reg.get_displacement_field_forward()
+        displacement.write(
+            os.path.join(args.output_path, args.patient, "SPECT", "spect2pet")
+        )
+
+        if args.save_plots:
+            plt.figure()
+            for i in range(3):
+                plt.subplot(3, 1, 1 + i)
+                im_slice = displacement.as_array()[displacement.shape[0]//2,:,:,0,i]
+                minmax = max(abs(im_slice.min()), abs(im_slice.max()))
+                plt.imshow(im_slice, cmap="seismic", vmin=-minmax, vmax=minmax)
+                plt.title(f"Displacement field in direction {i}")
+            plt.savefig(
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "displacement_field.png"
+                )
+            )
+        spect_ctac_zoomed_registered = reg.get_output()
+        spect_ctac_zoomed_registered.write(
+            os.path.join(args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed_registered.hv")
+        )
+
+        if args.save_plots:
+            plot_image_info(
+                spect_ctac_zoomed_registered,
+                os.path.join(
+                    args.output_path, args.patient, "SPECT", "ctac_FoV_corrected_crop_zoomed_registered_info.png"
+                ),
+                "SPECT u-map registered to PET",
+                ct=True
+            )
+
+        # ---------------------- Plot Difference Between PET and Registered SPECT ----------------------
+        pet_array = pet_ctac_crop_zoomed2pet.as_array()
+
+        spect_array = spect_ctac_zoomed_registered.as_array()
+
+        diff = pet_array - spect_array
+        diff_minmax = 120 #max(abs(diff.min()), abs(diff.max())) / 2
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        im0 = axes[0].imshow(
+            diff[diff.shape[0] // 2],
+            vmin=-diff_minmax,
+            vmax=diff_minmax,
+            cmap="seismic",
+        )
+        axes[1].imshow(
+            diff[:, diff.shape[1] // 2],
+            vmin=-diff_minmax,
+            vmax=diff_minmax,
+            cmap="seismic",
+        )
+        axes[2].imshow(
+            diff[:, :, diff.shape[2] // 2],
+            vmin=-diff_minmax,
+            vmax=diff_minmax,
+            cmap="seismic",
+        )
+        # cbar on left of first plot
+        cbar = fig.colorbar(
+            im0, 
+            ax=axes[0], 
+            orientation="vertical", 
+            location="left", 
+            shrink=0.7
+        )
+        cbar.set_label("PET - SPECT")
+
+        # sup title
+        fig.suptitle("Normed PET - Normed Registered SPECT")
+
+        # axis off
+        for ax in axes:
+            ax.axis("off")
+
+        plt.savefig(
+            os.path.join(
+                args.output_path, args.patient, "SPECT", "ctac_zoomed_reg_diff.png"
+            )
+        )
+        plt.savefig(
+            os.path.join(
+                args.output_path, args.patient, "PET", "ctac_zoomed_reg_diff.png"
+            )
+        )
+
+    # ---------------------- Run Reconstructions if Requested ----------------------
+    if args.do_reconstruction:
+        from pathlib import Path
+        directory = Path(__file__).parent.parent
+        pet_osem_script = os.path.join(directory, "pet_osem.py")
+        spect_osem_script = os.path.join(directory, "spect_osem.py")
+        
+        # Run PET reconstruction
+        try:
+            subprocess.run(
+                [sys.executable, pet_osem_script,
+                "--data_path", os.path.join(
+                    args.data_path, 
+                    args.patient, 
+                    "PET", 
+                    tof_str
+                ),
+                "--output_path", os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "PET",
+                    tof_str
+                ),
+                "--suffix", "both",
+                ],
+                check=True
+            )
+            print("PET reconstruction completed successfully.")
+            pet_recons = [
+                ImageData(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, "PET", 
+                    tof_str,
+                    f"pet_recon_{bp}.hv"
+                    )
+                ) for bp in bed_pos
+            ]
+            pet_combined_recon = ImageCombineOperator(
+                BlockDataContainer(*pet_recons)
+            ).direct(
+                BlockDataContainer(*pet_recons)
+            )
+            pet_combined_recon.write(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "PET", 
+                    tof_str,
+                    "pet_combined_recon.hv"
+                )
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"PET reconstruction failed: {e}")
+        
+        # Run SPECT reconstruction
+        try:
+            subprocess.run(
+                [sys.executable, spect_osem_script,
+                 "--data_path", os.path.join(
+                     args.data_path, 
+                     args.patient,
+                     "SPECT"
+                 ),
+                ],
+                check=True
+            )
+            print("SPECT reconstruction completed successfully.")
+            spect_recon = ImageData(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "SPECT", 
+                    "spect_recon.hv"
+                )
+            )
+            spect_recon.write(
+                os.path.join(
+                    args.output_path, 
+                    args.patient, 
+                    "SPECT", 
+                    "spect_recon.hv"
+                )
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"SPECT reconstruction failed: {e}")
+
+        if args.save_plots:
+            # Overlay for PET: use the combined (zoomed) u-map and the zoomed CTAC crop.
+            pet_overlay_path = os.path.join(
+                args.output_path, args.patient, "PET", "pet_mu_overlay.png"
+            )
+            plot_overlay(
+                pet_umap_zoomed2pet,
+                pet_combined_recon,
+                pet_overlay_path,
+                title="Combined PET u-map with PET overlay",
+                ct=True
+            )
+
+            # Overlay for SPECT: use the zoomed u-map and the registered CTAC image.
+            spect_overlay_path = os.path.join(
+                args.output_path, args.patient, "SPECT", "spect_mu_overlay.png"
+            )
+            plot_overlay(
+                spect_umap_zoomed2spect,
+                spect_recon,
+                spect_overlay_path,
+                title="SPECT u-map with Registered SPECT overlay",
+                ct=True
+            )
+
+
+
+        
 
 
 if __name__ == "__main__":
